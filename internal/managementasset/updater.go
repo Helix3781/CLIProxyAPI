@@ -189,6 +189,9 @@ func FilePath(configFilePath string) string {
 
 // EnsureLatestManagementHTML checks the latest management.html asset and updates the local copy when needed.
 // It coalesces concurrent sync attempts and returns whether the asset exists after the sync attempt.
+//
+// 无损升级：如果本地文件与 GitHub 上任何一个官方 release 的 hash 都不匹配，
+// 说明用户修改过本地文件，跳过自动更新以保护本地修改。
 func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL string, panelRepository string) bool {
 	if ctx == nil {
 		ctx = context.Background()
@@ -260,6 +263,18 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 			return nil, nil
 		}
 
+		// 无损升级检测：如果本地文件与最新版本不匹配，检查是否与任何一个历史版本匹配
+		// 如果不匹配任何历史版本，说明用户修改过，跳过自动更新
+		if !localFileMissing && localHash != "" && remoteHash != "" && !strings.EqualFold(remoteHash, localHash) {
+			isOfficial, checkErr := isOfficialRelease(ctx, client, panelRepository, localHash)
+			if checkErr != nil {
+				log.WithError(checkErr).Warn("failed to verify if local management asset is an official release")
+			} else if !isOfficial {
+				log.Warn("management asset has local modifications — skipping auto-upgrade to preserve changes")
+				return nil, nil
+			}
+		}
+
 		data, downloadedHash, err := downloadAsset(ctx, client, asset.BrowserDownloadURL)
 		if err != nil {
 			if localFileMissing {
@@ -289,6 +304,48 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 
 	_, err := os.Stat(localPath)
 	return err == nil
+}
+
+// isOfficialRelease 检查本地文件的 hash 是否与 GitHub 上任何一个官方 release 的 management.html 匹配。
+// 如果匹配，说明是官方版本，可以安全覆盖；如果不匹配，说明用户修改过，应该保留。
+func isOfficialRelease(ctx context.Context, client *http.Client, panelRepository string, localHash string) (bool, error) {
+	// 获取最近 10 个 releases 进行检查
+	releasesURL := resolveReleaseURL(panelRepository)
+	// 将 /releases/latest 替换为 /releases?per_page=10
+	releasesURL = strings.Replace(releasesURL, "/releases/latest", "/releases?per_page=10", 1)
+
+	headers := map[string]string{
+		"Accept":     "application/vnd.github+json",
+		"User-Agent": httpUserAgent,
+	}
+	if token := util.ResolveGitHubToken(); token != "" {
+		headers["Authorization"] = "Bearer " + token
+	}
+
+	data, err := httpfetch.GetBytes(ctx, client, releasesURL, headers, 0)
+	if err != nil {
+		return false, fmt.Errorf("fetch releases list: %w", err)
+	}
+
+	var releases []releaseResponse
+	if err = json.Unmarshal(data, &releases); err != nil {
+		return false, fmt.Errorf("decode releases response: %w", err)
+	}
+
+	// 检查每个 release 的 management.html asset digest
+	for i := range releases {
+		for j := range releases[i].Assets {
+			asset := &releases[i].Assets[j]
+			if strings.EqualFold(asset.Name, managementAssetName) {
+				remoteHash := parseDigest(asset.Digest)
+				if remoteHash != "" && strings.EqualFold(remoteHash, localHash) {
+					return true, nil
+				}
+			}
+		}
+	}
+
+	return false, nil
 }
 
 func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, localPath string) bool {
